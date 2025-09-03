@@ -16,7 +16,7 @@ import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
-from typing import Any, Dict, Generator, Literal, Optional, Tuple, cast]
+from typing import Any, Dict, Generator, Literal, Optional, Tuple, cast
 from fastmcp.server.auth.providers.jwt import StaticTokenVerifier
 
 import yaml
