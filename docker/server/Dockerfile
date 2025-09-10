@@ -29,4 +29,8 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 
 ENV PATH="/app/.venv/bin:$PATH"
 
-CMD ["mcp-server-snowflake", "--service-config-file", "/app/services/tools_config.yaml", "--transport", "sse"]
+RUN groupadd -r appuser && useradd -r -g appuser appuser
+RUN chown -R appuser:appuser /app
+USER appuser
+
+CMD ["mcp-server-snowflake", "--service-config-file", "/app/services/tools_config.yaml", "--transport", "streamable-http"]
