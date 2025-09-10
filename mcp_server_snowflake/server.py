@@ -526,13 +526,13 @@ def initialize_resources(snowflake_service: SnowflakeService, server: FastMCP):
 def initialize_tools(snowflake_service: SnowflakeService, server: FastMCP):
     if snowflake_service is not None:
         # Add tools for object manager
-        initialize_object_manager_tools(server, snowflake_service.root)
+        #initialize_object_manager_tools(server, snowflake_service.root)
 
         # Add tools for query manager
-        initialize_query_manager_tool(server, snowflake_service)
+        #initialize_query_manager_tool(server, snowflake_service)
 
         # Add tools for semantic manager
-        initialize_semantic_manager_tools(server, snowflake_service)
+        #initialize_semantic_manager_tools(server, snowflake_service)
 
         # Add tools for each configured search service
         if snowflake_service.search_services:
