@@ -33,4 +33,4 @@ RUN groupadd -r appuser && useradd -r -g appuser appuser
 RUN chown -R appuser:appuser /app
 USER appuser
 
-CMD ["mcp-server-snowflake", "--service-config-file", "/app/services/tools_config.yaml", "--transport", "streamable-http"]
+CMD ["mcp-server-snowflake", "--service-config-file", "/app/services/tools_config.yaml", "--transport", "sse"]
