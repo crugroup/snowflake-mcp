@@ -587,8 +587,8 @@ def main():
 
 
     # If SERVICE_CONFIG is provided as an env var, write it to the specified file
-    if 'SERVICE_CONFIG' in os.environ:
-        service_config = base64.b64decode(os.environ['SERVICE_CONFIG']).decode("utf-8")
+    if 'TOOL_CONFIG' in os.environ:
+        service_config = base64.b64decode(os.environ['TOOL_CONFIG']).decode("utf-8")
         logger.info(f"{service_config}")
         service_config_file = get_var(
             "service_config_file", "SERVICE_CONFIG_FILE", args
