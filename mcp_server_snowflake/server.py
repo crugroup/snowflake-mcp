@@ -13,6 +13,7 @@ import argparse
 import json
 import logging
 import os
+import base64
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
@@ -583,6 +584,18 @@ def main():
         )
     else:
         auth = None
+
+
+    # If SERVICE_CONFIG is provided as an env var, write it to the specified file
+    if 'SERVICE_CONFIG' in os.environ:
+        service_config = base64.b64decode(os.environ['SERVICE_CONFIG']).decode("utf-8")
+        logger.info(f"{service_config}")
+        service_config_file = get_var(
+            "service_config_file", "SERVICE_CONFIG_FILE", args
+        )
+        with open(service_config_file, "w") as f:
+            f.write(service_config)
+
 
     # Create server with lifespan that has access to args
     server = FastMCP("Snowflake MCP Server", lifespan=create_lifespan(args), auth=auth)
