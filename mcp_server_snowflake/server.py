@@ -23,6 +23,8 @@ from fastmcp.server.auth.providers.jwt import StaticTokenVerifier
 import yaml
 from fastmcp import FastMCP
 from fastmcp.tools import Tool
+from starlette.requests import Request
+from starlette.responses import Response
 from snowflake.connector import DictCursor, connect
 from snowflake.core import Root
 
@@ -526,13 +528,13 @@ def initialize_resources(snowflake_service: SnowflakeService, server: FastMCP):
 def initialize_tools(snowflake_service: SnowflakeService, server: FastMCP):
     if snowflake_service is not None:
         # Add tools for object manager
-        #initialize_object_manager_tools(server, snowflake_service.root)
+        # initialize_object_manager_tools(server, snowflake_service.root)
 
         # Add tools for query manager
-        #initialize_query_manager_tool(server, snowflake_service)
+        # initialize_query_manager_tool(server, snowflake_service)
 
         # Add tools for semantic manager
-        #initialize_semantic_manager_tools(server, snowflake_service)
+        # initialize_semantic_manager_tools(server, snowflake_service)
 
         # Add tools for each configured search service
         if snowflake_service.search_services:
@@ -572,8 +574,8 @@ def main():
     args = parse_arguments()
 
     # Set up authentication.
-    if 'MCP_AUTH_TOKEN' in os.environ:
-        MCP_AUTH_TOKEN = os.environ['MCP_AUTH_TOKEN']
+    if "MCP_AUTH_TOKEN" in os.environ:
+        MCP_AUTH_TOKEN = os.environ["MCP_AUTH_TOKEN"]
 
         auth = StaticTokenVerifier(
             tokens={
@@ -585,10 +587,9 @@ def main():
     else:
         auth = None
 
-
     # If SERVICE_CONFIG is provided as an env var, write it to the specified file
-    if 'TOOL_CONFIG' in os.environ:
-        service_config = base64.b64decode(os.environ['TOOL_CONFIG']).decode("utf-8")
+    if "TOOL_CONFIG" in os.environ:
+        service_config = base64.b64decode(os.environ["TOOL_CONFIG"]).decode("utf-8")
         logger.info(f"{service_config}")
         service_config_file = get_var(
             "service_config_file", "SERVICE_CONFIG_FILE", args
@@ -596,9 +597,12 @@ def main():
         with open(service_config_file, "w") as f:
             f.write(service_config)
 
-
     # Create server with lifespan that has access to args
     server = FastMCP("Snowflake MCP Server", lifespan=create_lifespan(args), auth=auth)
+
+    @server.custom_route("/health", methods=["GET"])
+    async def health_check(request: Request) -> Dict:
+        return Response(content="OK", status_code=200)
 
     try:
         logger.info("Starting Snowflake MCP Server...")
