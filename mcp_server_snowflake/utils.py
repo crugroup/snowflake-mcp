@@ -10,25 +10,52 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import json
-import logging
 import os
 import re
+import sys
 from functools import wraps
 from textwrap import dedent
 from typing import Awaitable, Callable, Optional, TypeVar, Union
 
 import requests
 import yaml
+from fastmcp.utilities.logging import get_logger
 from pydantic import BaseModel
 from typing_extensions import ParamSpec
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 P = ParamSpec("P")
 R = TypeVar("R")
 
 
-def execute_query(statement: str, snowflake_service):
+def warn_deprecated_params() -> None:
+    """Warn about deprecated CLI arguments and environment variables."""
+    deprecated_found = []
+
+    if "--account-identifier" in sys.argv:
+        logger.warning(
+            "DEPRECATION WARNING: '--account-identifier' is deprecated. Use '--account' instead."
+        )
+        deprecated_found.append("--account-identifier")
+
+    if "--pat" in sys.argv:
+        logger.warning(
+            "DEPRECATION WARNING: '--pat' is deprecated. Use '--password' instead."
+        )
+        deprecated_found.append("--pat")
+
+    if os.environ.get("SNOWFLAKE_PAT") and not os.environ.get("SNOWFLAKE_PASSWORD"):
+        logger.warning(
+            "DEPRECATION WARNING: 'SNOWFLAKE_PAT' is deprecated. Use 'SNOWFLAKE_PASSWORD' instead."
+        )
+        deprecated_found.append("SNOWFLAKE_PAT")
+
+    if deprecated_found:
+        logger.info(f"Deprecated parameters: {', '.join(deprecated_found)}")
+
+
+def execute_query(statement: str, snowflake_service, bindvars: list[str] = []):
     """Execute a Snowflake query and return the results using Python connector dictionary cursor."""
     with snowflake_service.get_connection(
         use_dict_cursor=True,
@@ -37,7 +64,7 @@ def execute_query(statement: str, snowflake_service):
         con,
         cur,
     ):
-        cur.execute(statement)
+        cur.execute(statement, bindvars)
         return cur.fetchall()
 
 
@@ -85,6 +112,22 @@ class AnalystResponse(BaseModel):
     text: str
     sql: Optional[str] = None
     results: Optional[Union[dict, list]] = None
+
+
+class AgentResponse(BaseModel):
+    """
+    Response model for Cortex Agent API results.
+
+    Represents the structured response from Cortex Agent containing
+    natural language text, generated SQL, and query execution results.
+
+    Attributes
+    ----------
+    results : str | dict | list
+        Agent results in various formats depending on query and configuration
+    """
+
+    results: Union[str, dict, list]
 
 
 class SearchResponse(BaseModel):
@@ -233,6 +276,61 @@ class SnowflakeResponse:
         ret = SearchResponse(results=content.get("results", []))
         return ret.model_dump_json()
 
+    def parse_agent_response(self, response_stream: requests.Response) -> str:
+        """
+        Parse Cortex Agent streaming API response to extract final text response.
+
+        Processes the streaming response to find the final 'response' event and
+        extracts the text content. Returns a formatted AgentResponse model
+        for consistency with other Cortex API parsers.
+
+        Parameters
+        ----------
+        response_stream : requests.Response
+            The streaming response object from a Cortex Agent API call
+
+        Returns
+        -------
+        str
+            JSON string containing formatted agent response with extracted text
+        """
+
+        # Parse Server-Sent Events (SSE) from Cortex Agent streaming response
+        is_final_response = False
+
+        # Iterate over the response stream line by line
+        for line in response_stream.iter_lines(decode_unicode=True):
+            line = line.strip()
+
+            # Look for the 'event: response' marker
+            if line == "event: response":
+                is_final_response = True
+            elif is_final_response and line.startswith("data: "):
+                # If the next line is 'data:', it contains the JSON payload we need
+                json_data = line[len("data: ") :]
+                try:
+                    final_text = (
+                        json.loads(json_data)
+                        .get("content", [{}])[-1]
+                        .get("text", "No final response found.")
+                    )
+                    # Return formatted AgentResponse for consistency with other parsers
+                    response = AgentResponse(results=final_text)
+                    return response.model_dump_json()
+                except (json.JSONDecodeError, IndexError, KeyError):
+                    response = AgentResponse(
+                        results="Error parsing agent response data."
+                    )
+                    return response.model_dump_json()
+
+            # If any other event type or line is encountered, reset the flag
+            elif line:
+                is_final_response = False
+
+        # Return formatted error response if no final response found
+        response = AgentResponse(results="No final response found.")
+        return response.model_dump_json()
+
     def snowflake_response(
         self,
         api: str,
@@ -278,6 +376,8 @@ class SnowflakeResponse:
                         )
                     case "search":
                         parsed = self.parse_search_response(response=raw_sse)
+                    case "agent":
+                        parsed = self.parse_agent_response(response_stream=raw_sse)
                 return parsed
 
             return response_parsers
@@ -322,7 +422,7 @@ class SnowflakeException(Exception):
     Raising a Snowflake exception:
 
     >>> raise SnowflakeException(
-    ...     tool="Cortex Analyst", message="Model not found", status_code=400
+    ...     tool="Cortex Analyst", message="Service not found", status_code=400
     ... )
     """
 
@@ -347,7 +447,7 @@ class SnowflakeException(Exception):
         Notes
         -----
         Status code handling:
-        - 400: Bad request errors with model validation
+        - 400: Bad request errors
         - 401: Authorization/authentication errors
         - Other codes: Generic error with status code
         """
@@ -356,10 +456,7 @@ class SnowflakeException(Exception):
 
         else:
             if self.status_code == 400:
-                if "unknown model" in self.message:
-                    return f"{self.tool} Error: Selected model not available or invalid.\n\nError Message: {self.message} "
-                else:
-                    return f"{self.tool} Error: The resource cannot be found.\n\nError Message: {self.message} "
+                return f"{self.tool} Error: Bad request - please check your input parameters.\n\nError Message: {self.message} "
 
             elif self.status_code == 401:
                 return f"{self.tool} Error: An authorization error occurred.\n\nError Message: {self.message} "
@@ -426,8 +523,15 @@ async def load_tools_config_resource(file_path: str) -> str:
     yaml.YAMLError
         If the YAML file is malformed
     """
-    with open(file_path, "r") as file:
-        tools_config = yaml.safe_load(file)
+    try:
+        with open(file_path, "r") as file:
+            tools_config = yaml.safe_load(file)
+    except FileNotFoundError:
+        logger.error(f"Service configuration file not found: {file_path}")
+        raise FileNotFoundError(f"Service configuration file not found: {file_path}")
+    except yaml.YAMLError as e:
+        logger.error(f"Invalid YAML in configuration file {file_path}: {e}")
+        raise yaml.YAMLError(f"Invalid YAML in configuration file {file_path}: {e}")
 
     return json.dumps(tools_config)
 
@@ -506,9 +610,9 @@ def get_login_params() -> dict:
             os.getenv("SNOWFLAKE_PRIVATE_KEY_FILE"),
             "Specifies the path to the private key file for the specified user.",
         ],
-        "private_key_pwd": [
-            "--private-key-pwd",
-            os.getenv("SNOWFLAKE_PRIVATE_KEY_PWD"),
+        "private_key_file_pwd": [
+            "--private-key-file-pwd",
+            os.getenv("SNOWFLAKE_PRIVATE_KEY_FILE_PWD"),
             "Specifies the passphrase to decrypt the private key file for the specified user.",
         ],
         "authenticator": [

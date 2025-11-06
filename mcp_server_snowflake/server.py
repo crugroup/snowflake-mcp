@@ -11,7 +11,6 @@
 # limitations under the License.
 import argparse
 import json
-import logging
 import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, contextmanager
@@ -20,11 +19,15 @@ from typing import Any, Dict, Generator, Literal, Optional, Tuple, cast
 
 import yaml
 from fastmcp import FastMCP
-from fastmcp.tools import Tool
+from fastmcp.utilities.logging import get_logger
 from snowflake.connector import DictCursor, connect
 from snowflake.core import Root
 
-import mcp_server_snowflake.cortex_services.tools as cortex_tools
+from mcp_server_snowflake.cortex_services.tools import (
+    initialize_cortex_agent_tool,
+    initialize_cortex_analyst_tool,
+    initialize_cortex_search_tool,
+)
 from mcp_server_snowflake.environment import (
     get_spcs_container_token,
     is_running_in_spcs_container,
@@ -39,17 +42,17 @@ from mcp_server_snowflake.utils import (
     cleanup_snowflake_service,
     get_login_params,
     load_tools_config_resource,
-    sanitize_tool_name,
     unpack_sql_statement_permissions,
+    warn_deprecated_params,
 )
 
 # Used to quantify Snowflake usage
 server_name = "mcp-server-snowflake"
 tag_major_version = 1
-tag_minor_version = 0
+tag_minor_version = 3
 query_tag = {"origin": "sf_sit", "name": "mcp_server"}
 
-logger = logging.getLogger(server_name)
+logger = get_logger(server_name)
 
 
 class SnowflakeService:
@@ -73,13 +76,17 @@ class SnowflakeService:
         Transport for the MCP server
     connection_params : dict
         Connection parameters for Snowflake connector
+    endpoint : str, default="/mcp"
+        Custom endpoint path for HTTP transports
 
     Attributes
     ----------
     service_config_file : str
         Path to configuration file
-    transport : Literal["stdio", "sse", "streamable-http"]
+    transport : Literal["stdio", "http", "sse", "streamable-http"]
         Transport for the MCP server
+    endpoint : str
+        Custom endpoint path for HTTP transports
     search_services : list
         List of configured search service specifications
     analyst_services : list
@@ -99,16 +106,28 @@ class SnowflakeService:
         service_config_file: str,
         transport: str,
         connection_params: dict,
+        endpoint: str = "/mcp",
     ):
+        if service_config_file is None:
+            raise ValueError(
+                "service_config_file cannot be None. Please provide a path to the service configuration file."
+            )
+
         self.service_config_file = str(Path(service_config_file).expanduser().resolve())
         self.config_path_uri = Path(self.service_config_file).as_uri()
-        self.transport = cast(Literal["stdio", "sse", "streamable-http"], transport)
+        self.transport = cast(
+            Literal["stdio", "http", "sse", "streamable-http"], transport
+        )
         self.connection_params = connection_params
+        self.endpoint = endpoint
         self.search_services = []
         self.analyst_services = []
         self.agent_services = []
         self.sql_statement_allowed = []
         self.sql_statement_disallowed = []
+        self.object_manager = False
+        self.query_manager = False
+        self.semantic_manager = False
         self.default_session_parameters: Dict[str, Any] = {}
         self.query_tag = query_tag if query_tag is not None else None
         self.tag_major_version = (
@@ -131,8 +150,7 @@ class SnowflakeService:
         Load and parse service specifications from configuration file.
 
         Reads the YAML configuration file and extracts service specifications
-        for search, analyst, and agent services. Also sets the default
-        completion model.
+        for all services managed by YAML configuration.
         """
         try:
             with open(self.service_config_file, "r") as file:
@@ -160,6 +178,11 @@ class SnowflakeService:
                     service_config.get("sql_statement_permissions", [])
                 )
             )
+            other_services = service_config.get("other_services", {})
+            if other_services is not None:
+                self.object_manager = other_services.get("object_manager", False)
+                self.query_manager = other_services.get("query_manager", False)
+                self.semantic_manager = other_services.get("semantic_manager", False)
 
         except Exception as e:
             logger.error(f"Error extracting service specifications: {e}")
@@ -275,6 +298,7 @@ class SnowflakeService:
                 **connection_params,
                 session_parameters=session_parameters,
                 client_session_keep_alive=True,
+                paramstyle="qmark",
             )
             if connection:  # Send zero compute query to capture query tag
                 self.send_initial_query(connection)
@@ -339,6 +363,7 @@ class SnowflakeService:
                     **connection_params,
                     session_parameters=session_parameters,
                     client_session_keep_alive=False,
+                    paramstyle="qmark",
                 )
 
             cursor = (
@@ -452,9 +477,29 @@ def parse_arguments():
     parser.add_argument(
         "--transport",
         required=False,
-        choices=["stdio", "sse", "streamable-http"],
+        choices=["stdio", "http", "sse", "streamable-http"],
         help="Transport for the MCP server",
         default="stdio",
+    )
+    parser.add_argument(
+        "--server-host",  # Avoid using simply host here as it conflicts with the host argument in the Snowflake Python Connector
+        required=False,
+        help="Host address to bind the server to (default: 0.0.0.0)",
+        default="0.0.0.0",
+    )
+    # These left as simply port and endpoint for backward compatibility with existing deployments
+    parser.add_argument(
+        "--port",
+        required=False,
+        type=int,
+        help="Port number for the server to listen on (default: 9000)",
+        default=9000,
+    )
+    parser.add_argument(
+        "--endpoint",
+        required=False,
+        help="Endpoint path for the MCP server (default: /mcp)",
+        default="/mcp",
     )
 
     return parser.parse_args()
@@ -481,12 +526,15 @@ def create_lifespan(args):
             "service_config_file", "SERVICE_CONFIG_FILE", args
         )
 
+        endpoint = os.environ.get("SNOWFLAKE_MCP_ENDPOINT", args.endpoint)
+
         snowflake_service = None
         try:
             snowflake_service = SnowflakeService(
                 service_config_file=service_config_file,
                 transport=args.transport,
                 connection_params=connection_params,
+                endpoint=endpoint or args.endpoint,
             )
 
             # Initialize tools and resources now that we have the service
@@ -524,50 +572,33 @@ def initialize_resources(snowflake_service: SnowflakeService, server: FastMCP):
 def initialize_tools(snowflake_service: SnowflakeService, server: FastMCP):
     if snowflake_service is not None:
         # Add tools for object manager
-        initialize_object_manager_tools(server, snowflake_service.root)
+        if snowflake_service.object_manager:
+            initialize_object_manager_tools(server, snowflake_service)
 
         # Add tools for query manager
-        initialize_query_manager_tool(server, snowflake_service)
+        if snowflake_service.query_manager:
+            initialize_query_manager_tool(server, snowflake_service)
 
         # Add tools for semantic manager
-        initialize_semantic_manager_tools(server, snowflake_service)
+        if snowflake_service.semantic_manager:
+            initialize_semantic_manager_tools(server, snowflake_service)
 
-        # Add tools for each configured search service
+        # Add tool for agent service
+        if snowflake_service.agent_services:
+            initialize_cortex_agent_tool(server, snowflake_service)
+
+        # Add tool for search service
         if snowflake_service.search_services:
-            for service in snowflake_service.search_services:
-                search_wrapper = cortex_tools.create_search_wrapper(
-                    snowflake_service=snowflake_service, service_details=service
-                )
-                server.add_tool(
-                    Tool.from_function(
-                        fn=search_wrapper,
-                        name=sanitize_tool_name(service.get("service_name")),
-                        description=service.get(
-                            "description",
-                            f"Search service: {service.get('service_name')}",
-                        ),
-                    )
-                )
+            initialize_cortex_search_tool(server, snowflake_service)
 
         if snowflake_service.analyst_services:
-            for service in snowflake_service.analyst_services:
-                cortex_analyst_wrapper = cortex_tools.create_cortex_analyst_wrapper(
-                    snowflake_service=snowflake_service, service_details=service
-                )
-                server.add_tool(
-                    Tool.from_function(
-                        fn=cortex_analyst_wrapper,
-                        name=sanitize_tool_name(service.get("service_name")),
-                        description=service.get(
-                            "description",
-                            f"Analyst service: {service.get('service_name')}",
-                        ),
-                    )
-                )
+            initialize_cortex_analyst_tool(server, snowflake_service)
 
 
 def main():
     args = parse_arguments()
+
+    warn_deprecated_params()
 
     # Create server with lifespan that has access to args
     server = FastMCP("Snowflake MCP Server", lifespan=create_lifespan(args))
@@ -576,11 +607,15 @@ def main():
         logger.info("Starting Snowflake MCP Server...")
 
         if args.transport and args.transport in [
+            "http",
             "sse",
             "streamable-http",
         ]:
+            host = os.environ.get("SNOWFLAKE_MCP_HOST", args.server_host)
+            port = int(os.environ.get("SNOWFLAKE_MCP_PORT", str(args.port)))
+            endpoint = os.environ.get("SNOWFLAKE_MCP_ENDPOINT", args.endpoint)
             logger.info(f"Starting server with transport: {args.transport}")
-            server.run(transport=args.transport, host="0.0.0.0", port=9000)
+            server.run(transport=args.transport, host=host, port=port, path=endpoint)
         else:
             logger.info(f"Starting server with transport: {args.transport or 'stdio'}")
             server.run(transport=args.transport or "stdio")
