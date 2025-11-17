@@ -1,0 +1,6 @@
+/venv
+.env
+docker-compose.yaml
+server.py
+test.py
+server.py.bak
